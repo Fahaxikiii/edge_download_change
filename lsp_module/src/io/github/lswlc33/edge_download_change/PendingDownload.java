@@ -21,6 +21,12 @@ final class PendingDownload {
     final Context appContext;
 
     /**
+     * Identity used to collapse repeated requests for the same download (URL + file name).
+     * Set by {@link DownloadHooks#buildPending}; null for downloads built elsewhere.
+     */
+    String dedupKey;
+
+    /**
      * The name is refined asynchronously (redirect probing) after the item was created,
      * so it is volatile and read through {@link #fileName()}/{@link #displayName()}.
      */

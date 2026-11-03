@@ -43,12 +43,21 @@ final class Str {
         return pick("Copy", "复制");
     }
 
+    static String dialogCancel() {
+        return pick("Cancel", "取消");
+    }
+
     static String dialogTarget(String target) {
         return pick("\"Download\" will hand it over to ", "「下载」将交给 ") + target;
     }
 
     // toasts
 
+
+    static String duplicateIgnored() {
+        return pick("This link was just handled - duplicate request ignored",
+                "该链接刚刚已处理，重复请求已忽略");
+    }
 
     static String linkFailed() {
         return pick("Could not get the link; no download was created", "未能获取下载链接，本次下载未创建");

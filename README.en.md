@@ -78,7 +78,9 @@ signature** rather than by its unstable name. The module hooks three things:
 2. the confirmation-dialog factory `rge.a` – replaces Edge's dialog; if the dialog appears before
    the download item, it waits for the item and then applies the user's choice;
 3. a cancel fallback – `removeDownload()` plus the official `DOWNLOAD_CANCEL` broadcast action
-   (resolved from the dex string pool) and one retry after 1.5 s.
+   (resolved from the dex string pool). Cancelling is idempotent per download id; the 1.5 s retry
+   only happens when the reflective call failed (previously every path cancelled again, so a single
+   download was cancelled four times).
 
 Tapping **Download** calls `DownloadManager.enqueue()` (or starts the chosen downloader app with an
 explicit intent); tapping **Copy** writes the link to the clipboard and cancels Edge's download.

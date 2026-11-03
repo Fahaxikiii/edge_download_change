@@ -43,6 +43,14 @@ final class DialogPresenter {
                     public void run() {
                         DownloadHooks.resolvePending(download, ACTION_DISMISS);
                     }
+                },
+                new Runnable() {
+                    @Override
+                    public void run() {
+                        // Edge's item is already cancelled, so dismissing here would lose the
+                        // download: hand it over instead of failing silently.
+                        DownloadHooks.onDialogUnavailable(download);
+                    }
                 });
         // The name is probed in the background; refresh the text when it arrives.
         download.setNameListener(new PendingDownload.NameListener() {
@@ -71,6 +79,8 @@ final class DialogPresenter {
             message.append("\n").append(formatSize(request.size));
         }
         message.append("\n\n「下载」将交给 ").append(RemoteSettings.downloaderLabel());
+        // No "unavailable" fallback here: without the download item there is no URL to hand
+        // over, so the only safe answer is to decline Edge's dialog.
         show(activity, message.toString(),
                 new Runnable() {
                     @Override
@@ -89,15 +99,22 @@ final class DialogPresenter {
                     public void run() {
                         DownloadHooks.resolveConfirm(request, ACTION_DISMISS);
                     }
-                });
+                },
+                null);
     }
 
+    /**
+     * @param onUnavailable run when the dialog cannot be displayed at all (null = behave like
+     *                      {@code onDismiss}). Used to keep a download whose Edge item was
+     *                      already cancelled from being lost.
+     */
     private static AlertDialog show(final Activity activity, String message,
-            final Runnable onCopy, final Runnable onDownload, final Runnable onDismiss) {
+            final Runnable onCopy, final Runnable onDownload, final Runnable onDismiss,
+            final Runnable onUnavailable) {
         if (activity == null || activity.isFinishing()
                 || (Build.VERSION.SDK_INT >= Build.VERSION_CODES.JELLY_BEAN_MR1 && activity.isDestroyed())) {
-            DownloadHooks.log(4, "no usable activity for the dialog, dismissing");
-            onDismiss.run();
+            DownloadHooks.log(4, "no usable activity for the dialog");
+            (onUnavailable != null ? onUnavailable : onDismiss).run();
             return null;
         }
         try {
@@ -116,6 +133,12 @@ final class DialogPresenter {
                             onCopy.run();
                         }
                     })
+                    .setNeutralButton(Str.dialogCancel(), new DialogInterface.OnClickListener() {
+                        @Override
+                        public void onClick(DialogInterface d, int which) {
+                            onDismiss.run();
+                        }
+                    })
                     .setOnCancelListener(new DialogInterface.OnCancelListener() {
                         @Override
                         public void onCancel(DialogInterface d) {
@@ -123,12 +146,15 @@ final class DialogPresenter {
                         }
                     })
                     .create();
-            dialog.setCanceledOnTouchOutside(true);
+            // A tap outside is a tap on the page, not an answer: the device log showed the
+            // dialog being dismissed seconds after it appeared, and the same download being
+            // requested again a few seconds later. Cancelling is now an explicit button.
+            dialog.setCanceledOnTouchOutside(false);
             dialog.show();
             return dialog;
         } catch (Throwable t) {
             DownloadHooks.log(5, "showing the dialog failed", t);
-            onDismiss.run();
+            (onUnavailable != null ? onUnavailable : onDismiss).run();
             return null;
         }
     }

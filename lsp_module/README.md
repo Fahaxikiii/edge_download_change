@@ -58,7 +58,7 @@ Edge 原本点击下载链接后走自带的下载管理器/确认弹窗。本�
 
 | Hook | 作用 |
 |---|---|
-| `DownloadManagerService.onDownloadItemCreated(DownloadItem)` | **主拦截点**。取到真实 URL（`DownloadInfo.a` GURL）、文件名（`e`）、MIME（`c`）、下载项 id（`DownloadItem.a()`）后**立即取消 Edge 的下载项**（`removeDownload` + `DOWNLOAD_CANCEL` 双通道，1.5s 后再重试一次），然后弹本模块的「复制 / 下载」对话框 |
+| `DownloadManagerService.onDownloadItemCreated(DownloadItem)` | **主拦截点**。取到真实 URL（`DownloadInfo.a` GURL）、文件名（`e`）、MIME（`c`）、下载项 id（`DownloadItem.a()`）后**立即取消 Edge 的下载项**（`removeDownload` + `DOWNLOAD_CANCEL` 双通道；按 guid 幂等，仅当反射失败时 1.5s 后重试一次），然后弹本模块的「复制 / 下载」对话框 |
 | Edge 下载确认框工厂 `(String 文件名, long 大小, org.chromium.base.Callback)V`（Edge 153 为混淆类 `rge.a`） | 按方法签名在 dex 中定位（`DexIndex`，不依赖混淆类名）。接管期间抑制 Edge 的确认框；若确认框先于下载项出现（理论上不会，架构上下载项先建），同样弹本模块的对话框，并在等待到下载项后执行选择；**从不回调 true**，所以 Edge 下载不会被启动 |
 | `Activity.dispatchTouchEvent` / `onUserInteraction` / `onResume` / `onPause` | 跟踪前台 Activity（弹窗挂靠）与最近用户操作；`onResume` 同时作为 chrome 分包延迟加载后的重试时机 |
 | `DownloadDialogBridge.showDialog`、`EdgeOneDriveDownloadBridge.queryUserChoice` | 接管期间抑制 Edge 剩余下载弹窗 |
@@ -82,12 +82,38 @@ Edge 小版本更新时通常仍能工作。
 
 1. URL 为 http/https（blob:/data: 等仍走 Edge 原流程）；
 2. 非"系统下载器托管项"（`DownloadItem.b == false`）；
-3. 最近 30 秒内有用户触摸操作，且存在前台 Edge Activity；
-4. 目标文件尚不存在（过滤恢复中的下载）；
+3. 存在前台 Edge Activity；
+4. 非恢复/历史下载项（`DownloadInfo.j == 0` 且 `q == 0`）；
 5. 非"保存网页"产物（.mhtml/.webarchive/multipart-related）；
-6. 8 秒内未对同一 URL+文件名重复弹窗。
+6. 同一 URL+文件名（归一化后）不在重复抑制窗口内：
+   - 交出去（下载/复制）之后 **30 秒**内不再接管；
+   - 用户取消之后只抑制 10 秒，且连续取消按 10→20→40→80 秒退避（上限 120 秒）；
+   - **重复项即使被抑制，也仍然取消 Edge 的下载项**（此前直接 return，那一份会漏给 Edge）。
+
+对话框不再支持"点框外取消"（`setCanceledOnTouchOutside(false)`）：真机日志里确认框出现后
+几秒就被点掉、随后同一下载又被请求，正是这条路径；取消改为显式的第三个按钮。
 
 ## 版本记录
+
+**未发布（2.13）：重复拦截 / 取消风暴修复**（依据 11-03 真机日志）
+
+日志中的问题：同一个 `127.0.0.1:5244/p/...apk?sign=...` 在 22 秒内被外跳 3 次（另 2 次被去重挡下），
+每次被取消 4 次（同一 guid 广播 `DOWNLOAD_CANCEL` 共 20 次），`intercepted download:` 行的文件名恒为空。
+
+- **重复抑制改成"按 URL 的下次请求窗口"**：8 秒窗口太短，第 10 秒的重复请求又会被完整接管。
+  现在交出去后 30 秒内不再弹窗；用户取消后只抑制 10 秒，并随连续取消退避（10/20/40/80 秒，上限 120 秒）。
+  被抑制的重复项**仍然取消 Edge 的下载项**（旧代码在去重分支直接 return，那一份会漏给 Edge 自己下载），
+  并给一句 Toast 说明"已忽略重复请求"，避免用户以为没反应而反复点。
+- **取消幂等**：`cancelEdgeDownload` 按 guid 记忆，已取消过就直接返回；1.5 秒重试只在反射失败时安排，
+  且重试前检查 `onDownloadItemRemoved`。日志里 4 次/项的取消广播降为 1 次。
+- **兼容重复挂载**：`installDownloadHooks` 加锁，`onDownloadItemCreated` 改用 `hookOnce`
+  （启动阶段 `install()` 会被 `onPackageLoaded` / `onPackageReady` / `onResume` 并发调用）。
+- **确认框定位放宽**：`reflectConfirmMethod` 不再要求方法 `static`（描述符扫描本身不筛 static，
+  这会让"扫到了候选类却判为未找到"），扫描日志会打印候选类列表；拦截成功后再补扫一次
+  （此时 chrome 分包必然已加载）。
+- **对话框**：新增显式「取消」按钮，关闭"点框外即取消"；确认框无法显示时改为**直接交给下载器**，
+  不再静默丢弃（Edge 的下载项此时已被取消）。
+- **日志**：`intercepted download:` 改用清洗后的文件名并带上大小；复制/跳转/取消都会写明确的结果行。
 
 **2.9（视觉重设计）**
 - App 全新深色视觉（GitHub 风配色，深色主题固定、各安卓版本/深浅色模式观感一致）：

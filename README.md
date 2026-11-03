@@ -89,7 +89,8 @@ Edge 是 Chromium 内核，**下载引擎在 native 层**，Java 侧只是桥接
 2. **确认弹窗工厂 `rge.a`** —— 拦截 Edge 自己的弹窗；若它比下载项先出现，则先接管弹窗、
    等下载项出现后再执行用户的选择；
 3. **取消兜底** —— 反射 `removeDownload()` 之外，还会向 `DownloadBroadcastManager` 发送
-   从 dex 字符串中解析出的官方 `DOWNLOAD_CANCEL` 动作，并在 1.5 秒后重试一次。
+   从 dex 字符串中解析出的官方 `DOWNLOAD_CANCEL` 动作；**每个下载项只取消一次**，只有反射
+   失败时才在 1.5 秒后重试（此前"每次调用都取消 + 固定重试"会导致同一下载被取消 4 次）。
 
 用户点「下载」→ 模块调用 `DownloadManager.enqueue()`（或第三方下载器的显式 Intent）
 创建下载；点「复制」→ 写入剪贴板并撤销 Edge 的下载。**Edge 的下载项在创建瞬间就被取消**

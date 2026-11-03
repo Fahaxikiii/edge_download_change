@@ -10,7 +10,6 @@ import android.widget.Toast;
 
 import java.lang.reflect.Field;
 import java.lang.reflect.Method;
-import java.lang.reflect.Modifier;
 import java.util.LinkedHashMap;
 import java.util.Map;
 
@@ -69,8 +68,15 @@ final class DownloadHooks {
     private static final long RECENT_ITEM_WINDOW_MS = 120_000L;
     /** How long to wait for the download item after a dialog without a known URL. */
     private static final long WAIT_ITEM_WINDOW_MS = 15_000L;
-    /** Same download is not reported twice within this window. */
-    private static final long DEDUP_WINDOW_MS = 8_000L;
+    /**
+     * Same download is not handed over twice within this window. The previous 8 s window was
+     * short enough that a retried download (page re-fire / user re-tap) was intercepted again
+     * a few seconds later, producing several parallel hand-offs for one file.
+     */
+    private static final long DEDUP_WINDOW_MS = 30_000L;
+    /** A dismissed dialog only suppresses the immediate repeat; consecutive dismissals back off. */
+    private static final long DEDUP_DISMISS_MS = 10_000L;
+    private static final long DEDUP_MAX_WINDOW_MS = 120_000L;
     /** Delayed so the descriptor scan never competes with Edge's own startup. */
     private static final long CONFIRM_SCAN_DELAY_MS = 5_000L;
     /** Bounded retries while Edge's chrome split is still being loaded. */
@@ -86,6 +92,10 @@ final class DownloadHooks {
     private static volatile boolean sDownloadHooksReady;
     private static volatile boolean sInstallLogged;
     private static volatile boolean sConfirmResolveStarted;
+    /** The first descriptor scan has finished (successfully or not). */
+    private static volatile boolean sConfirmScanDone;
+    /** The one post-interception rescan already happened. */
+    private static volatile boolean sConfirmRescanDone;
     private static volatile int sInstallRetries;
     private static volatile int sDumpCount;
 
@@ -106,8 +116,23 @@ final class DownloadHooks {
     private static volatile long sWaitUntilMs;
     private static volatile long sTakeoverUntilMs;
 
-    private static final Map<String, Long> sRecentDownloads = new LinkedHashMap<String, Long>();
+    /** How a download we already took over ended; drives the repeat suppression. */
+    private static final int OUTCOME_HANDOFF = 1;
+    private static final int OUTCOME_COPY = 2;
+    private static final int OUTCOME_DISMISS = 3;
+
+    private static final class Recent {
+        long suppressUntil;
+        int outcome;
+        int dismissals;
+    }
+
+    private static final Map<String, Recent> sRecentDownloads = new LinkedHashMap<String, Recent>();
     private static final java.util.Set<String> sInstalledHooks = new java.util.HashSet<String>();
+    /** Download ids that were already cancelled (bounded). */
+    private static final Map<String, Boolean> sCancelledIds = new LinkedHashMap<String, Boolean>();
+    /** Download ids Edge itself reported as removed (bounded). */
+    private static final Map<String, Boolean> sRemovedIds = new LinkedHashMap<String, Boolean>();
 
     private DownloadHooks() {}
 
@@ -184,7 +209,13 @@ final class DownloadHooks {
 
     // ------------------------------------------------------------------ download hooks
 
-    private static void installDownloadHooks(ClassLoader cl) {
+    /**
+     * Synchronized: install() is reached from onPackageLoaded, onPackageReady and every
+     * Activity.onResume, so two threads may enter while the chrome split is still loading
+     * (the device log showed two "deferred" attempts a few ms apart). Without the lock both
+     * could pass the ready check and hook the same callback twice.
+     */
+    private static synchronized void installDownloadHooks(ClassLoader cl) {
         if (sDownloadHooksReady) return;
         try {
             // 1) Edge's download confirmation dialog (located by descriptor, not by name).
@@ -204,7 +235,9 @@ final class DownloadHooks {
             Class<?> itemClass = Class.forName(
                     "org.chromium.chrome.browser.download.DownloadItem", false, cl);
             Method onCreated = serviceClass.getDeclaredMethod("onDownloadItemCreated", itemClass);
-            hook(onCreated, new Hooker() {
+            // hookOnce: a partially failed installation must not hook the main interception
+            // point twice (every download would then be handled twice).
+            hookOnce("service.onDownloadItemCreated", onCreated, new Hooker() {
                 @Override
                 public Object intercept(Chain chain) throws Throwable {
                     try {
@@ -331,7 +364,9 @@ final class DownloadHooks {
                     new Hooker() {
                         @Override
                         public Object intercept(Chain chain) throws Throwable {
-                            log(4, "evt onDownloadItemRemoved id=" + Reflect.string(chain.getArg(0)));
+                            String guid = Reflect.string(chain.getArg(0));
+                            markRemoved(guid);
+                            log(4, "evt onDownloadItemRemoved id=" + guid);
                             return chain.proceed();
                         }
                     });
@@ -361,6 +396,7 @@ final class DownloadHooks {
                 Reflect.pickString(info, "c", "mime"));
         if (download == null) return;
         log(4, "resolved waiting dialog from item update: " + url);
+        markRecent(download.dedupKey);
         cancelEdgeDownload(download);
         applyAction(download, decision);
     }
@@ -425,10 +461,12 @@ final class DownloadHooks {
             if (isHookInstalled("confirmDialog")) return;
             Context context = application();
             if (context != null) {
-                for (final String name : DexIndex.findDefaultPackageClasses(context,
-                        DexIndex.CONFIRM_DIALOG_PROTO)) {
+                java.util.List<String> candidates = DexIndex.findDefaultPackageClasses(context,
+                        DexIndex.CONFIRM_DIALOG_PROTO);
+                log(4, "descriptor scan candidates: " + candidates.size() + " " + candidates);
+                for (final String name : candidates) {
                     if (isHookInstalled("confirmDialog")) return;
-                    final Method found = reflectConfirmMethod(cl, name);
+                    final Method found = findConfirmMethod(cl, name);
                     if (found != null) {
                         log(4, "located confirm dialog class by descriptor: " + name);
                         Bg.post(new Runnable() {
@@ -441,6 +479,7 @@ final class DownloadHooks {
                     }
                 }
                 log(5, "confirm dialog class not found by descriptor either");
+                sConfirmScanDone = true;
                 return;
             }
             try {
@@ -449,7 +488,40 @@ final class DownloadHooks {
                 return;
             }
         }
+        sConfirmScanDone = true;
         log(4, "gave up resolving the confirm dialog class (no context)");
+    }
+
+    /**
+     * Retries the descriptor scan once a download has actually been intercepted: by then the
+     * chrome split is guaranteed to be loaded, which is not true during Edge's startup when
+     * the first scan runs (device log: "not found by descriptor either" at t+5 s, while the
+     * download hooks could only be installed later).
+     */
+    private static void rescanConfirmDialogOnce(ClassLoader cl) {
+        if (isHookInstalled("confirmDialog") || !sConfirmScanDone || sConfirmRescanDone) return;
+        final ClassLoader loader = cl != null ? cl : sTargetClassLoader;
+        if (loader == null) return;
+        sConfirmRescanDone = true;
+        log(4, "retrying the confirm dialog scan now that the chrome split is loaded");
+        Bg.run(new Runnable() {
+            @Override
+            public void run() {
+                scanForConfirmDialog(loader);
+            }
+        });
+    }
+
+    /**
+     * Looks the class up in the latest known loader first and in the one captured when the
+     * scan was scheduled second: the latter may predate the chrome split.
+     */
+    private static Method findConfirmMethod(ClassLoader captured, String name) {
+        Method found = reflectConfirmMethod(sTargetClassLoader, name);
+        if (found == null && captured != null && captured != sTargetClassLoader) {
+            found = reflectConfirmMethod(captured, name);
+        }
+        return found;
     }
 
     private static boolean isHookInstalled(String key) {
@@ -464,11 +536,19 @@ final class DownloadHooks {
         }
     }
 
+    /**
+     * Finds the {@code (String, long, Callback)void} method on the class.
+     *
+     * Instance methods are accepted as well: the descriptor scan in {@link DexIndex} lists
+     * every method of the class, so requiring {@code static} here made a class that was
+     * found by the scan look "not found" (the scan logged candidates, the lookup rejected
+     * them). Whether the method is static changes nothing for the hook.
+     */
     private static Method reflectConfirmMethod(ClassLoader cl, String className) {
+        if (cl == null) return null;
         try {
             Class<?> c = Class.forName(className, false, cl);
             for (Method m : c.getDeclaredMethods()) {
-                if (!Modifier.isStatic(m.getModifiers())) continue;
                 Class<?>[] p = m.getParameterTypes();
                 if (p.length == 3 && p[0] == String.class && p[1] == long.class
                         && "org.chromium.base.Callback".equals(p[2].getName())) {
@@ -568,6 +648,7 @@ final class DownloadHooks {
             int decision = sWaitDecision;
             clearWaitState();
             log(4, "resolved waiting dialog with item " + url);
+            markRecent(download.dedupKey);
             cancelEdgeDownload(download);
             applyAction(download, decision);
             return;
@@ -588,12 +669,24 @@ final class DownloadHooks {
             return;
         }
 
-        // Edge usually creates the download item a few milliseconds *before* the
-        // confirmation dialog; remember it so the dialog can still be mapped to its URL.
-        if (download != null) {
-            sRecentItem = download;
-            sRecentItemAt = SystemClock.elapsedRealtime();
+        // The repeat check runs before the pending check: a second item for a download we
+        // already own must still be cancelled, otherwise this copy is left to Edge (which
+        // shows its own prompt and may download it behind our back).
+        if (isDuplicate(download.dedupKey)) {
+            log(4, "skip: duplicate event for " + url + " (Edge item cancelled)");
+            cancelEdgeDownload(download);
+            // Without this the user sees the request "do nothing" and taps again, which is
+            // how a single download turned into three hand-offs on device.
+            toastAsync(Str.duplicateIgnored());
+            return;
         }
+
+        // Edge usually creates the download item a few milliseconds *before* the confirmation
+        // dialog; remember it so a dialog that arrives after we bailed out (no activity,
+        // another takeover in progress) can still be mapped to its URL. Duplicates are
+        // excluded above: their Edge item is cancelled and must not be offered again.
+        sRecentItem = download;
+        sRecentItemAt = SystemClock.elapsedRealtime();
 
         if (isPending()) {
             log(4, "skip: takeover already in progress");
@@ -610,12 +703,7 @@ final class DownloadHooks {
             return;
         }
 
-        String dedupKey = url + '|' + fileName;
-        if (isDuplicate(dedupKey)) {
-            log(4, "skip: duplicate event for " + url);
-            return;
-        }
-        markRecent(dedupKey);
+        markRecent(download.dedupKey);
 
         // Stop Edge's download before any body data is transferred (target determination
         // and the transfer only happen after this callback); the download the user finally
@@ -625,8 +713,16 @@ final class DownloadHooks {
         sPending = download;
         sRecentItem = null;
         sTakeoverUntilMs = SystemClock.elapsedRealtime() + TAKEOVER_WINDOW_MS;
-        log(4, "intercepted download: " + fileName + " (" + mime + ") " + url);
+        log(4, "intercepted download: " + download.displayName() + " (" + mime + ", "
+                + describeSize(Reflect.longValue(info, "k")) + ") " + url);
+        // The chrome split is loaded for sure at this point: a scan that ran during startup
+        // must be retried, otherwise Edge's own confirmation dialog stays unhooked.
+        rescanConfirmDialogOnce(sTargetClassLoader);
         showPendingAsync(activity, download);
+    }
+
+    private static String describeSize(long bytes) {
+        return bytes > 0 ? bytes + " bytes" : "size unknown";
     }
 
     private static PendingDownload buildPending(Object item, Object info, Object service,
@@ -649,8 +745,20 @@ final class DownloadHooks {
         if (!cleanName.equals(fileName)) {
             log(4, "sanitized file name: '" + fileName + "' -> '" + cleanName + "'");
         }
-        return new PendingDownload(guid, namespace, otrProfileId, serializeOtrProfileId(otrProfileId),
-                url, cleanName, mime, referrer, service, context);
+        PendingDownload download = new PendingDownload(guid, namespace, otrProfileId,
+                serializeOtrProfileId(otrProfileId), url, cleanName, mime, referrer, service, context);
+        // Stable identity of this download for repeat suppression. The sanitized name is used
+        // (not the raw one) because the raw name is empty at creation time for many items.
+        download.dedupKey = dedupKey(url, cleanName);
+        return download;
+    }
+
+    private static String dedupKey(String url, String fileName) {
+        String path = url == null ? "" : url;
+        int fragment = path.indexOf('#');
+        if (fragment >= 0) path = path.substring(0, fragment);
+        String name = fileName == null ? "" : fileName.toLowerCase(java.util.Locale.ROOT);
+        return path + '|' + name;
     }
 
     // ------------------------------------------------------------------ interception: dialog first
@@ -740,7 +848,12 @@ final class DownloadHooks {
         MAIN.post(new Runnable() {
             @Override
             public void run() {
-                if (SystemClock.elapsedRealtime() > takeoverAt) return;
+                if (SystemClock.elapsedRealtime() > takeoverAt) {
+                    // Edge's item is already cancelled: dismissing here would lose it.
+                    log(4, "takeover expired before the dialog could be shown");
+                    onDialogUnavailable(download);
+                    return;
+                }
                 DialogPresenter.showForPending(activity, download);
             }
         });
@@ -751,7 +864,13 @@ final class DownloadHooks {
         MAIN.post(new Runnable() {
             @Override
             public void run() {
-                if (SystemClock.elapsedRealtime() > takeoverAt) return;
+                if (SystemClock.elapsedRealtime() > takeoverAt) {
+                    // Edge's dialog was suppressed and its callback is still unanswered;
+                    // decline it so Edge does not wait forever.
+                    log(4, "takeover expired before the confirm dialog could be shown");
+                    invokeCallback(request.callback, Boolean.FALSE);
+                    return;
+                }
                 DialogPresenter.showForConfirm(activity, request);
             }
         });
@@ -760,7 +879,8 @@ final class DownloadHooks {
     /** Called by the dialog when the user answered a known-download dialog. */
     static void resolvePending(PendingDownload download, int action) {
         if (sPending == download) sPending = null;
-        // Already cancelled at item creation; repeated calls are idempotent insurance.
+        // Already cancelled at item creation; cancelEdgeDownload() is idempotent, so this is
+        // only insurance for the rare path where the first attempt failed.
         cancelEdgeDownload(download);
         applyAction(download, action);
     }
@@ -806,15 +926,33 @@ final class DownloadHooks {
     private static void applyAction(PendingDownload download, int action) {
         switch (action) {
             case DialogPresenter.ACTION_COPY:
+                log(4, "user chose copy: " + download.url);
                 DialogPresenter.copyLink(download);
+                markOutcome(download.dedupKey, OUTCOME_COPY);
                 break;
             case DialogPresenter.ACTION_DOWNLOAD:
+                log(4, "user chose download: " + download.displayName());
                 startSelectedDownloader(download);
+                markOutcome(download.dedupKey, OUTCOME_HANDOFF);
                 break;
             default:
-                log(4, "download cancelled by the user");
+                log(4, "dialog dismissed by the user, nothing was handed over: " + download.url);
+                markOutcome(download.dedupKey, OUTCOME_DISMISS);
                 break;
         }
+    }
+
+    /**
+     * The dialog could not be displayed (no usable activity / builder failure). The Edge item
+     * was already cancelled at creation time, so dismissing here would lose the download
+     * silently - hand it over instead.
+     */
+    static void onDialogUnavailable(PendingDownload download) {
+        if (sPending == download) sPending = null;
+        log(4, "dialog could not be shown, handing the download over directly: " + download.url);
+        cancelEdgeDownload(download);
+        startSelectedDownloader(download);
+        markOutcome(download.dedupKey, OUTCOME_HANDOFF);
     }
 
     /** Hands the download to the downloader selected in the module settings. */
@@ -846,7 +984,7 @@ final class DownloadHooks {
         // No installed-check here: Edge's process has its own package visibility, so the
         // launch result is the only reliable signal.
         if (launchExternal(download, entry)) {
-            log(4, "handed over to " + label + " (" + pkg + ")");
+            log(4, "handed over to " + label + " (" + pkg + "): " + download.url);
             return;
         }
         log(4, "starting " + pkg + " failed, using the system downloader");
@@ -941,45 +1079,159 @@ final class DownloadHooks {
         return mime != null && mime.startsWith("multipart/related");
     }
 
+    /**
+     * True when this download was handled too recently to be taken over again. A repeat is
+     * still cancelled by the caller - only the second dialog / hand-off is suppressed.
+     */
     private static boolean isDuplicate(String key) {
+        if (key == null) return false;
+        String detail = null;
+        boolean duplicate;
         synchronized (sRecentDownloads) {
-            Long when = sRecentDownloads.get(key);
-            return when != null && SystemClock.elapsedRealtime() - when < DEDUP_WINDOW_MS;
+            Recent recent = sRecentDownloads.get(key);
+            if (recent == null) return false;
+            long now = SystemClock.elapsedRealtime();
+            if (now >= recent.suppressUntil) {
+                // The window expired: a fresh dialog is allowed again. Dismiss counts are kept
+                // so a repeated dismissal keeps backing off.
+                if (recent.outcome != OUTCOME_DISMISS) sRecentDownloads.remove(key);
+                return false;
+            }
+            duplicate = true;
+            detail = "repeat within " + ((recent.suppressUntil - now) / 1000L) + " s (outcome="
+                    + recent.outcome + ", dismissals=" + recent.dismissals + ")";
+        }
+        log(4, detail);
+        return duplicate;
+    }
+
+    /**
+     * Remembers that the dialog for this download is now on screen. The window covers the
+     * whole takeover, so a repeat that arrives while the user is still looking at the dialog
+     * is treated as a duplicate instead of slipping past {@link #isPending()} once the
+     * takeover window has elapsed.
+     */
+    private static void markRecent(String key) {
+        if (key == null) return;
+        synchronized (sRecentDownloads) {
+            Recent recent = sRecentDownloads.get(key);
+            if (recent == null) {
+                recent = new Recent();
+                sRecentDownloads.put(key, recent);
+            }
+            long window = Math.max(DEDUP_WINDOW_MS, TAKEOVER_WINDOW_MS);
+            recent.suppressUntil = SystemClock.elapsedRealtime() + window;
+            trim(sRecentDownloads, 16);
         }
     }
 
-    private static void markRecent(String key) {
+    /**
+     * Records how the download ended. A hand-off suppresses an immediate repeat (the page or
+     * a double tap usually fires the same download again); a dismissal only suppresses the
+     * next few seconds and backs off further on each repeat, so an accidental dismissal does
+     * not trap the user.
+     */
+    private static void markOutcome(String key, int outcome) {
+        if (key == null) return;
+        String detail = null;
         synchronized (sRecentDownloads) {
-            sRecentDownloads.put(key, SystemClock.elapsedRealtime());
-            while (sRecentDownloads.size() > 16) {
-                String oldest = sRecentDownloads.keySet().iterator().next();
-                sRecentDownloads.remove(oldest);
+            Recent recent = sRecentDownloads.get(key);
+            if (recent == null) {
+                recent = new Recent();
+                sRecentDownloads.put(key, recent);
             }
+            recent.outcome = outcome;
+            long now = SystemClock.elapsedRealtime();
+            if (outcome == OUTCOME_DISMISS) {
+                recent.dismissals++;
+                int shift = Math.min(recent.dismissals - 1, 4);
+                long window = Math.min(DEDUP_DISMISS_MS << shift, DEDUP_MAX_WINDOW_MS);
+                recent.suppressUntil = now + window;
+                detail = "repeat window after dismissal #" + recent.dismissals + ": "
+                        + (window / 1000L) + " s";
+            } else {
+                recent.dismissals = 0;
+                recent.suppressUntil = now + DEDUP_WINDOW_MS;
+            }
+            trim(sRecentDownloads, 16);
+        }
+        if (detail != null) log(4, detail);
+    }
+
+    private static <K, V> void trim(Map<K, V> map, int max) {
+        while (map.size() > max) {
+            K oldest = map.keySet().iterator().next();
+            map.remove(oldest);
         }
     }
 
     // ------------------------------------------------------------------ actions
 
-    /** Cancels the in-app download so Edge's own download manager never owns the file. */
+    /**
+     * Cancels the in-app download so Edge's own download manager never owns the file.
+     *
+     * Idempotent: the device log showed four cancel broadcasts for a single download
+     * (created-path cancel + its retry, then again from the dialog result). Every path now
+     * goes through here and only the first call acts; a retry happens only when the
+     * removeDownload call failed.
+     */
     static void cancelEdgeDownload(PendingDownload download) {
         if (download == null) return;
-        cancelNow(download);
-        // Retry shortly after in case the first attempt was not effective on this build.
+        final String guid = download.guid;
+        synchronized (sCancelledIds) {
+            if (sCancelledIds.containsKey(guid)) {
+                log(4, "cancel already requested for " + guid);
+                return;
+            }
+            sCancelledIds.put(guid, Boolean.TRUE);
+            trim(sCancelledIds, 64);
+        }
+        boolean removed = cancelNow(download);
+        if (removed) return;
+        // The attempt failed: drop the memo so a later call (dialog result, close, ...) can
+        // still try, and retry once shortly after.
+        synchronized (sCancelledIds) {
+            sCancelledIds.remove(guid);
+        }
         final PendingDownload target = download;
         MAIN.postDelayed(new Runnable() {
             @Override
             public void run() {
+                if (isRemoved(guid)) {
+                    log(4, "cancel retry skipped, " + guid + " was already removed");
+                    return;
+                }
                 cancelNow(target);
             }
         }, 1500L);
     }
 
     /** Runs both cancel channels; either one alone is enough to stop the download. */
-    private static void cancelNow(PendingDownload download) {
+    private static boolean cancelNow(PendingDownload download) {
+        if (isRemoved(download.guid)) {
+            log(4, "cancel skipped, " + download.guid + " was already removed");
+            return true;
+        }
         boolean removed = cancelByRemove(download);
         // The notification-action channel is cheap and idempotent, so it is always sent too.
         cancelByNotificationAction(download);
         if (!removed) log(4, "removeDownload path failed for " + download.guid);
+        return removed;
+    }
+
+    private static boolean isRemoved(String guid) {
+        if (guid == null) return false;
+        synchronized (sRemovedIds) {
+            return sRemovedIds.containsKey(guid);
+        }
+    }
+
+    private static void markRemoved(String guid) {
+        if (guid == null || guid.length() == 0) return;
+        synchronized (sRemovedIds) {
+            sRemovedIds.put(guid, Boolean.TRUE);
+            trim(sRemovedIds, 64);
+        }
     }
 
     private static boolean cancelByRemove(PendingDownload download) {
