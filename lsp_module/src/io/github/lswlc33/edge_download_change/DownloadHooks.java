@@ -265,6 +265,15 @@ final class DownloadHooks {
                 log(4, "download hooks installed in " + processName);
                 RemoteSettings.reportState("inject", "hooks installed");
                 RemoteSettings.startHeartbeat();
+                // Warm the settings cache off the main thread: the first download must already
+                // know the configured target even when the module app is in the stopped state
+                // (right after an install/update) and its provider cannot be started.
+                Bg.run(new Runnable() {
+                    @Override
+                    public void run() {
+                        RemoteSettings.prefetch();
+                    }
+                });
             }
         } catch (Throwable t) {
             // The chrome split is usually not loaded yet on the first attempts; that is

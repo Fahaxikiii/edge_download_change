@@ -16,9 +16,23 @@ import io.github.libxposed.api.XposedInterface;
 /**
  * Injected side channel to the module app.
  *
- * Settings are read live from the app's ContentProvider (falling back to the framework's
- * read-only remote preferences when the provider cannot be reached). Status and log lines
- * are pushed back through the same provider and end up in the app's log view.
+ * Settings come from three places, in order of availability:
+ *
+ * <ol>
+ *   <li>a cache written into <b>Edge's own</b> prefs ({@value #PREFS_CACHE}) every time a real
+ *       source answered - this is what keeps the configured downloader across a cold start
+ *       while the module app cannot be reached;</li>
+ *   <li>the framework's remote preferences (read-only, and empty for this module because the
+ *       app stores its settings in a plain private file);</li>
+ *   <li>the module app's ContentProvider - the live source, but Android refuses to start a
+ *       stopped app's provider, which is the state right after the module was installed or
+ *       updated, so this path is retried in the background instead of falling back to the
+ *       default downloader.</li>
+ * </ol>
+ *
+ * Status and log lines are pushed back through the provider and end up in the app's log view.
+ * A status report is retried until it is delivered, so the app does not stay on "not
+ * activated" just because the report happened during the stopped-app window.
  */
 final class RemoteSettings {
 
@@ -30,6 +44,15 @@ final class RemoteSettings {
     private static final long STATE_RETRY_MS = 2_000L;
     private static final int MAX_BUFFER_LINES = 400;
 
+    /**
+     * Last settings that were actually readable, kept in Edge's own shared preferences.
+     *
+     * Device report: after installing the module the app is in the stopped state, so the
+     * provider call fails; the injected side then fell back to the "system downloader"
+     * default and every download went there until the user opened the module app.
+     */
+    private static final String PREFS_CACHE = "edc_settings_cache";
+
     private static final ArrayDeque<String> BUFFER = new ArrayDeque<String>();
     private static final SimpleDateFormat TIME =
             new SimpleDateFormat("MM-dd HH:mm:ss.SSS", Locale.US);
@@ -38,15 +61,23 @@ final class RemoteSettings {
     private static volatile String sDownloader = Downloaders.ID_SYSTEM;
     private static volatile String sCustomPackage = "";
     private static volatile long sFetchedAt;
-    private static volatile long sLastAsyncRefresh;
+    private static volatile boolean sCacheLoaded;
     private static volatile boolean sFlushScheduled;
     private static volatile boolean sHeartbeatStarted;
     private static volatile boolean sStateRetryScheduled;
     private static volatile String sPendingStateEvent;
     private static volatile String sPendingStateDetail;
+    private static volatile int sStateAttempts;
     private static volatile long sProviderBrokenAt;
+    private static volatile String sLastSettingsLog;
+
+    /** Provider refresh scheduling (independent of the log backoff). */
+    private static volatile boolean sSyncScheduled;
+    private static volatile int sSyncAttempts;
+
     /** Retry the provider after this long even if it failed before (app may have been started). */
     private static final long PROVIDER_RETRY_MS = 30_000L;
+    private static final int MAX_STATE_ATTEMPTS = 30;
 
     private RemoteSettings() {}
 
@@ -72,49 +103,149 @@ final class RemoteSettings {
         return Downloaders.labelOf(downloaderId(), customPackage());
     }
 
+    /**
+     * Loads the settings ahead of the first download (called once the hooks are in place), so
+     * a first-time provider failure has a chance to be retried before the user taps a link.
+     */
+    static void prefetch() {
+        refreshIfStale();
+    }
+
     private static void refreshIfStale() {
+        loadCacheOnce();
         if (SystemClock.elapsedRealtime() - sFetchedAt < CACHE_MS) return;
         sFetchedAt = SystemClock.elapsedRealtime();
-        // Fast path (no IPC): the framework's remote preferences, which mirror the app's
-        // own SharedPreferences file. Read-only in hooked apps - exactly our direction.
-        boolean loaded = false;
+        if (readRemotePreferences()) {
+            saveCache();
+            return;
+        }
+        // The provider is the only live source; in the stopped-app window the call fails, so
+        // it is retried with a short backoff instead of leaving the default in place.
+        scheduleSync();
+    }
+
+    /**
+     * @return true when the framework had real values for us. An empty remote preference set
+     *         is not "loaded": the module app never publishes into the framework store (its
+     *         settings are a plain private SharedPreferences file), so treating the empty
+     *         result as authoritative is what pinned the downloader to "system".
+     */
+    private static boolean readRemotePreferences() {
         try {
             XposedInterface api = DownloadHooks.api();
-            if (api != null) {
-                SharedPreferences prefs = api.getRemotePreferences(BuildInfo.PREFS_SETTINGS);
-                sEnabled = prefs.getBoolean(BuildInfo.KEY_ENABLED, sEnabled);
-                String downloader = prefs.getString(BuildInfo.KEY_DOWNLOADER, sDownloader);
-                if (downloader != null && downloader.length() > 0) sDownloader = downloader;
-                String custom = prefs.getString(BuildInfo.KEY_CUSTOM_PACKAGE, sCustomPackage);
-                if (custom != null) sCustomPackage = custom;
-                loaded = true;
+            if (api == null) return false;
+            SharedPreferences prefs = api.getRemotePreferences(BuildInfo.PREFS_SETTINGS);
+            if (!prefs.contains(BuildInfo.KEY_DOWNLOADER)
+                    && !prefs.contains(BuildInfo.KEY_ENABLED)) {
+                logSettingsOnce("remote preferences empty -> provider is the source");
+                return false;
             }
+            boolean changed = apply(prefs.getBoolean(BuildInfo.KEY_ENABLED, sEnabled),
+                    prefs.getString(BuildInfo.KEY_DOWNLOADER, sDownloader),
+                    prefs.getString(BuildInfo.KEY_CUSTOM_PACKAGE, sCustomPackage));
+            if (changed) logSettings("remote preferences");
+            return true;
+        } catch (Throwable t) {
+            logSettingsOnce("remote preferences unavailable: " + t);
+            return false;
+        }
+    }
+
+    private static void loadCacheOnce() {
+        if (sCacheLoaded) return;
+        Context context = DownloadHooks.application();
+        if (context == null) return;      // retried on the next call
+        sCacheLoaded = true;
+        try {
+            SharedPreferences cache = context.getSharedPreferences(PREFS_CACHE, Context.MODE_PRIVATE);
+            if (!cache.contains(BuildInfo.KEY_DOWNLOADER)) return;
+            boolean changed = apply(cache.getBoolean(BuildInfo.KEY_ENABLED, sEnabled),
+                    cache.getString(BuildInfo.KEY_DOWNLOADER, sDownloader),
+                    cache.getString(BuildInfo.KEY_CUSTOM_PACKAGE, sCustomPackage));
+            if (changed) logSettings("cache");
+        } catch (Throwable t) {
+            logSettingsOnce("settings cache unreadable: " + t);
+        }
+    }
+
+    private static void saveCache() {
+        Context context = DownloadHooks.application();
+        if (context == null) return;
+        try {
+            context.getSharedPreferences(PREFS_CACHE, Context.MODE_PRIVATE).edit()
+                    .putBoolean(BuildInfo.KEY_ENABLED, sEnabled)
+                    .putString(BuildInfo.KEY_DOWNLOADER, sDownloader)
+                    .putString(BuildInfo.KEY_CUSTOM_PACKAGE, sCustomPackage)
+                    .apply();
         } catch (Throwable ignored) {
         }
-        // Calibrate through the provider off the main thread; the answer also carries the
-        // settings on every log/heartbeat report, so changes converge quickly.
-        if (!loaded || SystemClock.elapsedRealtime() - sLastAsyncRefresh > CACHE_MS) {
-            sLastAsyncRefresh = SystemClock.elapsedRealtime();
-            Bg.run(new Runnable() {
-                @Override
-                public void run() {
-                    Bundle values = queryProvider();
-                    if (values != null) {
-                        applySettings(values);
-                        sFetchedAt = SystemClock.elapsedRealtime();
-                    }
-                }
-            });
-        }
+    }
+
+    /** Merges a settings bundle and returns true when something actually changed. */
+    private static boolean apply(boolean enabled, String downloader, String custom) {
+        boolean changed = enabled != sEnabled
+                || (downloader != null && downloader.length() > 0 && !downloader.equals(sDownloader))
+                || (custom != null && !custom.equals(sCustomPackage));
+        sEnabled = enabled;
+        if (downloader != null && downloader.length() > 0) sDownloader = downloader;
+        if (custom != null) sCustomPackage = custom;
+        return changed;
     }
 
     private static void applySettings(Bundle values) {
         if (values == null) return;
-        sEnabled = values.getBoolean("enabled", sEnabled);
-        String downloader = values.getString("downloader");
-        if (downloader != null && downloader.length() > 0) sDownloader = downloader;
-        String custom = values.getString("custom");
-        if (custom != null) sCustomPackage = custom;
+        boolean changed = apply(values.getBoolean("enabled", sEnabled),
+                values.getString("downloader"), values.getString("custom"));
+        if (changed) logSettings("module app");
+    }
+
+    private static void logSettings(String source) {
+        StringBuilder sb = new StringBuilder("settings from ").append(source)
+                .append(": enabled=").append(sEnabled)
+                .append(", downloader=").append(sDownloader);
+        if (sCustomPackage.length() > 0) sb.append(", custom=").append(sCustomPackage);
+        String line = sb.toString();
+        if (line.equals(sLastSettingsLog)) return;
+        sLastSettingsLog = line;
+        log(line);
+    }
+
+    private static void logSettingsOnce(String message) {
+        if (message.equals(sLastSettingsLog)) return;
+        sLastSettingsLog = message;
+        log(message);
+    }
+
+    /**
+     * Queries the provider with backoff (0.5 s, 1 s, 2 s, ... capped at 15 s) until it answers.
+     * It can answer late - the module app may be started by a later launch or by the user -
+     * so the loop does not give up permanently.
+     */
+    private static void scheduleSync() {
+        synchronized (RemoteSettings.class) {
+            if (sSyncScheduled) return;
+            sSyncScheduled = true;
+            sSyncAttempts++;
+            int shift = Math.min(sSyncAttempts - 1, 5);
+            long delay = Math.min(500L << shift, 15_000L);
+            Bg.postDelayed(new Runnable() {
+                @Override
+                public void run() {
+                    synchronized (RemoteSettings.class) {
+                        sSyncScheduled = false;
+                    }
+                    Bundle values = queryProvider();
+                    if (values != null) {
+                        applySettings(values);
+                        sFetchedAt = SystemClock.elapsedRealtime();
+                        sSyncAttempts = 0;
+                        saveCache();
+                    } else {
+                        scheduleSync();
+                    }
+                }
+            }, delay);
+        }
     }
 
     private static Bundle queryProvider() {
@@ -132,12 +263,15 @@ final class RemoteSettings {
 
     /** Reports the injected process state (drives the app's activation indicator). */
     static void reportState(String event, String detail) {
+        sPendingStateEvent = event;
+        sPendingStateDetail = detail;
+        // A new event starts a new retry budget (the heartbeat calls this once a minute, so
+        // the app keeps getting a chance to learn that the module is alive).
+        sStateAttempts = 0;
         Context context = DownloadHooks.application();
         if (context == null) {
             // Edge's Application does not exist yet during early startup; keep the report
             // and retry as soon as a context is available instead of losing it.
-            sPendingStateEvent = event;
-            sPendingStateDetail = detail;
             DownloadHooks.log(4, "state report deferred (no context yet): " + event);
             scheduleStateRetry();
             return;
@@ -152,8 +286,9 @@ final class RemoteSettings {
     }
 
     private static void scheduleStateRetry() {
-        if (sStateRetryScheduled) return;
+        if (sStateRetryScheduled || sStateAttempts >= MAX_STATE_ATTEMPTS) return;
         sStateRetryScheduled = true;
+        sStateAttempts++;
         Bg.postDelayed(new Runnable() {
             @Override
             public void run() {
@@ -171,10 +306,7 @@ final class RemoteSettings {
             scheduleStateRetry();
             return;
         }
-        sPendingStateEvent = null;
-        final String detail = sPendingStateDetail;
-        sPendingStateDetail = null;
-        sendState(context, event, detail);
+        sendState(context, event, sPendingStateDetail);
     }
 
     private static void sendState(final Context context, final String event, final String detail) {
@@ -182,7 +314,17 @@ final class RemoteSettings {
         Bg.run(new Runnable() {
             @Override
             public void run() {
-                send(context, event, detail, process, frameworkString());
+                // State reports bypass the log backoff: the app's activation indicator is
+                // what tells the user whether the module works at all.
+                if (send(context, event, detail, process, frameworkString(), true)) {
+                    sStateAttempts = 0;
+                    if (event.equals(sPendingStateEvent)) {
+                        sPendingStateEvent = null;
+                        sPendingStateDetail = null;
+                    }
+                } else {
+                    scheduleStateRetry();
+                }
             }
         });
     }
@@ -264,7 +406,7 @@ final class RemoteSettings {
             requeue(payload);
             return;
         }
-        if (!send(context, "log", payload, DownloadHooks.processName, frameworkString())) {
+        if (!send(context, "log", payload, DownloadHooks.processName, frameworkString(), false)) {
             requeue(payload);
         }
     }
@@ -283,9 +425,13 @@ final class RemoteSettings {
         return brokenAt != 0 && SystemClock.elapsedRealtime() - brokenAt < PROVIDER_RETRY_MS;
     }
 
+    /**
+     * @param force bypass the log backoff (used for state reports); still records the failure
+     *              so log lines do not hammer a dead provider.
+     */
     private static boolean send(Context context, String event, String text, String process,
-            String framework) {
-        if (isProviderBroken()) return false;
+            String framework, boolean force) {
+        if (!force && isProviderBroken()) return false;
         try {
             Bundle extras = new Bundle();
             extras.putString("event", event);
@@ -299,9 +445,12 @@ final class RemoteSettings {
             // without an extra round trip.
             applySettings(response);
             sFetchedAt = SystemClock.elapsedRealtime();
+            sSyncAttempts = 0;
+            saveCache();
             return true;
         } catch (Throwable t) {
-            // The module app may be force-stopped; back off instead of retrying every line.
+            // The module app may be force-stopped (or just installed); back off instead of
+            // retrying every line. State reports have their own retry loop.
             sProviderBrokenAt = SystemClock.elapsedRealtime();
             return false;
         }
