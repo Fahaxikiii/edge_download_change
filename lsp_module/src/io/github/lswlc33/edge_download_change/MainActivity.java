@@ -7,6 +7,8 @@ import android.content.Intent;
 import android.content.pm.PackageInfo;
 import android.graphics.Typeface;
 import android.os.Bundle;
+import android.os.Handler;
+import android.os.Looper;
 import android.text.InputType;
 import android.util.TypedValue;
 import android.view.Gravity;
@@ -54,10 +56,34 @@ public class MainActivity extends Activity {
         setContentView(scroll);
     }
 
+    /**
+     * The activation indicator is driven by a heartbeat from Edge's process, which may land a
+     * second or two after this screen is already drawn (for example right after the module app
+     * was started and the provider became reachable again). Polling while the screen is visible
+     * lets the badge flip to "activated" on its own instead of requiring a manual refresh.
+     */
+    private static final long STATUS_POLL_MS = 2_000L;
+    private final Handler statusHandler = new Handler(Looper.getMainLooper());
+    private final Runnable statusPoll = new Runnable() {
+        @Override
+        public void run() {
+            refresh();
+            statusHandler.postDelayed(this, STATUS_POLL_MS);
+        }
+    };
+
     @Override
     protected void onResume() {
         super.onResume();
         refresh();
+        statusHandler.removeCallbacks(statusPoll);
+        statusHandler.postDelayed(statusPoll, STATUS_POLL_MS);
+    }
+
+    @Override
+    protected void onPause() {
+        super.onPause();
+        statusHandler.removeCallbacks(statusPoll);
     }
 
     // ------------------------------------------------------------------ sections
